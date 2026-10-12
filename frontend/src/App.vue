@@ -7,15 +7,19 @@ import PreloadView from './components/PreloadView.vue'
 import VodDetailHeader from './components/VodDetailHeader.vue'
 import { clampEpisodePage, episodePageIndex, episodePageRanges, paginateEpisodes } from './episodes'
 import { createLibraryThumbPipeline } from './libraryThumb'
+import ContentCardList from './components/ContentCardList.vue'
 import { contentCardStyleLabel, contentCardStyleOptions, normalizeContentCardStyle, type ContentCardStyle } from './contentCardStyle'
+import { historyCardItem, type ContentCardItem } from './contentCardItem'
+import { imgError, scrollxEnter, scrollxLeave } from './contentListDom'
 import { createPlaybackSettings, PLAYBACK_SETTING_ITEMS, type PlaybackSettingKey, type PlaybackSettingsApi } from './playbackSettings'
 import { VodAutomation, nextEpisodeInSource, sameNameEpisodeOnSource, type VodAutomationHost } from './playbackAutomation'
 import { resolveSkipAction, type SkipRuntime, type VodSkipMarks } from './vodSkip'
 import { initializeHomeState } from './startup'
-import { playbackPlanForMode, resolvePlaybackFallback, shouldPauseStalePlayback, shouldRecordVodProgress, shouldShowMpvInstallPrompt, type ActivePlaybackSession, type PlaybackScope, type PlaybackStatus } from './playbackScope'
+import { isMpvUnavailableError, mpvInstallHint, playbackPlanForMode, resolvePlaybackFallback, shouldPauseStalePlayback, shouldRecordVodProgress, shouldShowMpvInstallPrompt, type ActivePlaybackSession, type PlaybackScope, type PlaybackStatus } from './playbackScope'
 import { createVodSearchCache, isCurrentVodCategoryRequest, isVodSearchCacheValid, nextVodCategoryRequest, nextVodSearchRequest, pickResumeSeek, removeVodFavorite, removeVodHistory, removeVodSearchHistory, resolveVodSelection, shouldShowVodNoResults, upsertVodSearchHistory, vodBackTarget, vodResumeView, vodSearchQueryForReturn, type VodDetailOrigin, type VodSearchCache, type VodView } from './vodNavigation'
+import { buildVodSourceDeadInfo, vodSourceDeadBackLabel, vodSourceDeadBackTarget, type VodSourceDeadInfo } from './vodSourceDead'
 import { appendVodItems, hasNextVodPage, nextVodPage } from './vodPagination'
-import { formatUpdatedAt, normalizeLeaderboard } from './donation'
+import { donationView, formatUpdatedAt, normalizeLeaderboard, type DonationStatus } from './donation'
 import DOMPurify from 'dompurify'
 
 // 爱发电赞助主页
@@ -74,7 +78,7 @@ const vodPage = ref(0)
 const vodHasMore = ref(false)
 const vodListEnd = ref(false)
 const vodListLoading = ref(false)
-const vodListRef = ref<HTMLElement | null>(null)
+const vodListRef = ref<InstanceType<typeof ContentCardList> | null>(null)
 let vodCategoryRequest = 0
 let vodListRequest = 0
 const vodCategoryLoading = ref(false)
@@ -103,7 +107,7 @@ const preloadPlan = ref<PlaybackPlan | null>(null)
 let preloadGeneration = 0
 let nextPlaybackToken = 0
 const mpvReady = ref(false)
-const mpvFallbackRequested = ref(false)
+const mpvNeeded = ref(false)
 const mpvInstallMode = ref('')
 const installMessage = ref('')
 const vodSources = ref<SourceRecord[]>([])
@@ -139,6 +143,11 @@ const libraryThumbPipeline = createLibraryThumbPipeline({
 })
 // 延迟续播目标：进详情时记下上次看的集数与进度，等用户点播放才套用。
 const vodResume = ref<{ EpID: string; Progress: number } | null>(null)
+// 详情加载中标题：详情请求还在跑时非空，底部提示条显示「正在加载《…》…」，
+// 避免 15 秒超时期间页面看起来像卡死。同时兼作并发入口闸门。
+const vodDetailLoading = ref('')
+// 点播源失效弹窗：详情请求失败（站点连不上 / 超时）时弹出，给出换站搜索的出口。
+const vodSourceDead = ref<{ info: VodSourceDeadInfo; origin: VodDetailOrigin } | null>(null)
 const logs = ref('')
 const showLogs = ref(false)
 const copyMsg = ref('')
@@ -162,6 +171,9 @@ const showDisclaimer = ref(false)
 const showOpenSource = ref(false)
 const showDonations = ref(false)
 const donationLeaderboard = ref(normalizeLeaderboard(null))
+const donationStatus = ref<DonationStatus>('idle')
+const donationViewState = computed(() => donationView(donationStatus.value, donationLeaderboard.value.Donors))
+const donationUpdatedText = computed(() => formatUpdatedAt(donationLeaderboard.value.UpdatedAt))
 const catsCollapsed = ref(false)
 const infoCollapsed = ref(false)
 
@@ -196,7 +208,7 @@ const deleteConfirmation = ref<{
 } | null>(null)
 let lastProgressSave = 0
 
-const showMpvInstallPrompt = computed(() => shouldShowMpvInstallPrompt(platform.value, mpvReady.value, mpvFallbackRequested.value))
+const showMpvInstallPrompt = computed(() => shouldShowMpvInstallPrompt(platform.value, mpvReady.value, mpvNeeded.value))
 
 const activeEpisodes = computed(() => (vodDetail.value?.Episodes ?? []).filter(ep => ep.Source === activeSource.value))
 const episodePages = computed(() => paginateEpisodes(activeEpisodes.value))
@@ -273,10 +285,47 @@ function siteName(site: string) {
   if (!site) return ''
   return sources.value.find(s => s.ID === site)?.Name ?? site
 }
-function vodItemSub(it: VodItem) {
-  const parts = [it.Site ? siteName(it.Site) : '', it.Group].filter(Boolean)
-  return parts.join(' · ')
+
+// openVodSourceDead 详情请求失败时弹「无法访问点播源」弹窗。错误仍写后端日志，
+// 但不进底部红条——站点连不上是常态，不是程序故障。
+function openVodSourceDead(site: string, vodTitle: string, origin: VodDetailOrigin, e: unknown) {
+  ShellService.LogError(String(e)).catch(() => {})
+  vodSourceDead.value = { info: buildVodSourceDeadInfo(siteName(site), vodTitle, e), origin }
 }
+
+// 四处内容列表共用 ContentCardList，各自把原始数据归一成 ContentCardItem。
+// 数组与源数据一一对应：组件只回传下标，父级用它取回自己的对象。
+const homeCardItems = computed<ContentCardItem[]>(() => homeHistory.value.map(h => historyCardItem(
+  h.Site + h.VodID,
+  h.VodLogo,
+  h.VodTitle,
+  h.SiteName || h.Site,
+  h.EpName,
+  fmtProgress(h.Progress),
+)))
+
+const favoriteCardItems = computed<ContentCardItem[]>(() => vodFavorites.value.map(f => ({
+  key: f.Site + f.VodID,
+  logo: f.Logo,
+  title: f.Title,
+  site: siteName(f.Site) || f.Site,
+  detail: f.Group || '',
+})))
+
+// 点播条目（列表页与搜索结果共用）。没有站点名时把分类顶到站点位，与列表模式
+// 原先的 vodItemSub 输出保持一致；两者都缺时留空，卡片徽标不渲染。
+function vodCardItem(it: VodItem): ContentCardItem {
+  const site = it.Site ? siteName(it.Site) : ''
+  return {
+    key: it.ID + (it.Site || ''),
+    logo: it.Logo,
+    title: it.Title,
+    site: site || it.Group || '',
+    detail: site ? (it.Group || '') : '',
+  }
+}
+
+const vodCardItems = computed<ContentCardItem[]>(() => visibleVodItems.value.map(vodCardItem))
 
 async function refresh() {
   try {
@@ -298,18 +347,40 @@ function handleError(e: unknown) {
   ShellService.LogError(msg).catch(() => {})
 }
 
+// notePlaybackFailure 播放失败时的共同处理：如果这次失败是因为缺 mpv，
+// 就打开安装提示。
+//
+// 本地媒体库、HEVC 的 HLS、RTMP 会**直接**路由到 mpv，不经过 Web，因此不会
+// 触发 Web→mpv 的降级回调；只靠降级置位的话，这类失败永远不会提示安装 mpv。
+function notePlaybackFailure(message: string) {
+  if (isMpvUnavailableError(message)) mpvNeeded.value = true
+}
+
+// setVodPlaybackError 记下播放失败原因，界面回显之外再写入后端日志。
+// 播放失败（尤其是 mpv 报错）此前只活在界面提示里，用户没法把「查看日志」
+// 发给我们，只能截图——而这恰恰是排查播放问题时最需要的信息。
+function setVodPlaybackError(message: string) {
+  vodPlaybackError.value = message
+  if (!message) return
+  notePlaybackFailure(message)
+  ShellService.LogError(message).catch(() => {})
+}
+
 async function openAbout() {
   try { internalVersion.value = await ShellService.InternalVersion() } catch { /* 忽略 */ }
   showAbout.value = true
 }
 
-// openDonations 只在用户打开榜单时拉取；请求失败保持静默，不弹错误提示。
+// openDonations 只在用户打开榜单时拉取；失败不弹全局错误，由弹窗正文提示重试，
+// 且保留上一次成功的数据，避免回退成空态或丢掉已经看到的榜单。
 async function openDonations() {
   showDonations.value = true
+  donationStatus.value = 'loading'
   try {
     donationLeaderboard.value = normalizeLeaderboard(await ShellService.GetDonationLeaderboard())
+    donationStatus.value = 'ready'
   } catch {
-    donationLeaderboard.value = normalizeLeaderboard(null)
+    donationStatus.value = 'failed'
   }
 }
 
@@ -333,7 +404,7 @@ async function refreshMpvStatus() {
   const s = await ShellService.MPVStatus()
   mpvReady.value = s.Available
   mpvInstallMode.value = s.InstallMode
-  if (s.Available) mpvFallbackRequested.value = false
+  if (s.Available) mpvNeeded.value = false
 }
 
 async function installMpv() {
@@ -511,9 +582,12 @@ function closeCardContextMenu() {
   cardContextMenu.value = null
 }
 
-function isContextCard(kind: 'history' | 'favorite', item: VodHistoryInfo | VodFavoriteInfo) {
-  return cardContextMenu.value?.kind === kind && cardContextMenu.value.item === item
-}
+// activeDeleteKey 是当前展开了删除遮罩的条目 key。原先按对象身份比较，改成按 key
+// 是因为列表交给 ContentCardList 渲染后，父级拿到的是下标而不是原对象引用。
+const activeDeleteKey = computed(() => {
+  const menu = cardContextMenu.value
+  return menu ? menu.item.Site + menu.item.VodID : null
+})
 
 function requestDeleteContextCard() {
   if (!cardContextMenu.value) return
@@ -573,6 +647,9 @@ async function resumeVod(h: VodHistoryInfo) {
     await playLibraryItem(h.VodID)
     return
   }
+  if (vodDetailLoading.value) return // 上一个详情请求还没回，忽略连点
+  vodSourceDead.value = null
+  vodDetailLoading.value = h.VodTitle
   try {
     await stopPlayback('live')
     mode.value = 'vod'
@@ -582,9 +659,17 @@ async function resumeVod(h: VodHistoryInfo) {
     vodDetailOrigin.value = 'home'
     vodView.value = 'detail'
     vodResume.value = null
-    vodDetail.value = await ShellService.VodDetail(h.Site, h.VodID)
+    // 先清空上一条记录留下的详情，加载期间与失败后都不残留旧内容。
+    vodDetail.value = null
+    const d = await ShellService.VodDetail(h.Site, h.VodID)
+    d.Description = DOMPurify.sanitize(d.Description)
+    vodDetail.value = d
     await applyVodResume(h)
-  } catch (e) { handleError(e) }
+  } catch (e) {
+    openVodSourceDead(h.Site, h.VodTitle, 'home', e)
+  } finally {
+    vodDetailLoading.value = ''
+  }
 }
 
 async function playLibraryItem(path: string) {
@@ -615,6 +700,7 @@ async function playLibraryItem(path: string) {
       vodPlaybackToken.value = 0
       vodPlaybackStatus.value = 'error'
       vodPlaybackError.value = String(e)
+      notePlaybackFailure(String(e))
       handleError(e)
     }
   }
@@ -752,6 +838,7 @@ async function play(c: ChannelInfo) {
       livePlaybackToken.value = 0
       livePlaybackStatus.value = 'error'
       livePlaybackError.value = String(e)
+      notePlaybackFailure(String(e))
       handleError(e)
     }
   }
@@ -877,7 +964,7 @@ function onVodListWheel(event: WheelEvent) {
 }
 
 function scrollVodListTop() {
-  vodListRef.value?.scrollTo({ top: 0, behavior: 'smooth' })
+  vodListRef.value?.scrollToTop()
 }
 
 async function selectVodCategory(id: string) {
@@ -941,12 +1028,19 @@ async function invalidateSearch() {
 async function openVodDetail(item: VodItem) {
   errMsg.value = ''
   vodResume.value = null
+  if (vodDetailLoading.value) return // 上一个详情请求还没回，忽略连点
+  // 站点与来源在 try 外先定好：失败分支要靠它弹失效弹窗。
+  const site = item.Site || activeSite.value
+  const origin: VodDetailOrigin = mode.value === 'favorites'
+    ? 'favorites'
+    : mode.value === 'search' || vodView.value === 'search' ? 'search' : 'list'
+  vodDetailOrigin.value = origin
+  vodSourceDead.value = null
+  vodDetailLoading.value = item.Title
+  // 清掉上一条留下的详情，失败后 openVodFavorite 的 `!vodDetail.value` 守卫才靠得住。
+  vodDetail.value = null
   try {
     if (searching.value) await cancelSearch()
-    const site = item.Site || activeSite.value
-    vodDetailOrigin.value = mode.value === 'favorites'
-      ? 'favorites'
-      : mode.value === 'search' || vodView.value === 'search' ? 'search' : 'list'
     detailSite.value = site
     const d = await ShellService.VodDetail(site, item.ID)
     d.Description = DOMPurify.sanitize(d.Description)
@@ -956,7 +1050,11 @@ async function openVodDetail(item: VodItem) {
     activeSource.value = d.Sources?.[0] ?? ''
     resetEpisodePage()
     vodFavorited.value = await ShellService.IsVodFavorite(site, d.ID)
-  } catch (e) { handleError(e) }
+  } catch (e) {
+    openVodSourceDead(site, item.Title, origin, e)
+  } finally {
+    vodDetailLoading.value = ''
+  }
 }
 
 async function openVodFavorite(favorite: VodFavoriteInfo) {
@@ -969,6 +1067,24 @@ async function openVodFavorite(favorite: VodFavoriteInfo) {
   })
   if (!vodDetail.value) return // openVodDetail 内部已 handleError 且不重抛，守卫失败加载
   await prepareVodResume(favorite.Site, favorite.VodID)
+}
+
+// vodSourceDeadSearch 关掉失效弹窗，把剧名填进搜索框并发起全站搜索，
+// 让用户换一个能播的站点（搜索页本身就在所有站点里查）。
+function vodSourceDeadSearch() {
+  vodQuery.value = vodSourceDead.value?.info.vodTitle ?? ''
+  vodSourceDead.value = null
+  void vodSearch()
+}
+
+// vodSourceDeadBack 关掉失效弹窗：从首页记录进来的，详情加载前已经切到详情页，
+// 需要回首页；收藏/搜索/列表路径在详情落地前没离开原页面，关掉弹窗即可。
+async function vodSourceDeadBack() {
+  const origin = vodSourceDead.value?.origin ?? 'list'
+  vodSourceDead.value = null
+  if (vodSourceDeadBackTarget(origin) !== 'home') return
+  vodDetailOrigin.value = 'home'
+  await backFromVodDetail()
 }
 
 async function backFromVodDetail() {
@@ -1040,6 +1156,7 @@ async function doPlayEpisode(site: string, epID: string, epName: string, source:
       vodPlayerLoading.value = false
       vodPlaybackStatus.value = 'error'
       vodPlaybackError.value = String(e)
+      notePlaybackFailure(String(e))
       throw e
     }
     return false
@@ -1073,7 +1190,7 @@ async function playEpisode(ep: EpisodeInfo) {
 }
 
 async function fallbackToMpv(scope: PlaybackScope, id: string, token: number, position: number) {
-  mpvFallbackRequested.value = true
+  mpvNeeded.value = true
   if (scope === 'live') {
     livePlaybackStatus.value = 'preparing'
     livePlaybackError.value = ''
@@ -1112,11 +1229,13 @@ async function fallbackToMpv(scope: PlaybackScope, id: string, token: number, po
         livePlaybackToken.value = 0
         livePlaybackStatus.value = 'error'
         livePlaybackError.value = String(e)
+        notePlaybackFailure(String(e))
       } else {
         vodPlaybackPlan.value = null
         vodPlaybackToken.value = 0
         vodPlaybackStatus.value = 'error'
         vodPlaybackError.value = String(e)
+        notePlaybackFailure(String(e))
       }
       handleError(e)
     }
@@ -1185,7 +1304,7 @@ const vodAutomation = new VodAutomation({
   },
   onAllSourcesFailed: () => {
     vodPlaybackStatus.value = 'error'
-    vodPlaybackError.value = '所有线路均无法播放当前剧集'
+    setVodPlaybackError('所有线路均无法播放当前剧集')
   },
 } satisfies VodAutomationHost)
 
@@ -1196,7 +1315,7 @@ function onVodPlaybackSignal(token: number, state: PlaybackState, message?: stri
     void vodAutomation.ended(token)
     return
   }
-  if (state === 'error' && message) vodPlaybackError.value = message
+  if (state === 'error' && message) setVodPlaybackError(message)
   if (state === 'playing' || state === 'error') vodPlayerLoading.value = false
   if (state === 'ready') applySkip(token)
   vodAutomation.signal(token, state)
@@ -1444,30 +1563,6 @@ async function checkUpdate() {
   }
 }
 
-// imgError 隐藏加载失败的图片（部分源 vod_pic 为空/失效/被防盗链拦截）。
-function imgError(e: Event) {
-  ;(e.target as HTMLImageElement).style.display = 'none'
-}
-
-// scrollxEnter/Leave 让过长文本在悬停时自动左滑揭示隐藏部分（无手动滚动条）。
-// 纯 CSS 做不到：translateX 百分比相对自身宽度，无法得知溢出量，故用 JS 量取。
-function scrollxEnter(e: MouseEvent) {
-  const box = e.currentTarget as HTMLElement
-  const inner = box.firstElementChild as HTMLElement | null
-  if (!inner) return
-  const overflow = inner.scrollWidth - box.clientWidth
-  if (overflow <= 0) return
-  inner.style.transition = `transform ${Math.min(3000, 600 + overflow * 4)}ms ease-out`
-  inner.style.transform = `translateX(${-overflow}px)`
-}
-function scrollxLeave(e: MouseEvent) {
-  const box = e.currentTarget as HTMLElement
-  const inner = box.firstElementChild as HTMLElement | null
-  if (!inner) return
-  inner.style.transition = 'transform 300ms ease-in-out'
-  inner.style.transform = ''
-}
-
 function openContentCardStyle() {
   showContentCardStyle.value = true
 }
@@ -1526,7 +1621,7 @@ onBeforeUnmount(() => {
     </header>
 
     <div v-if="showMpvInstallPrompt" class="mpv-install" aria-live="polite">
-      <span>mpv 插件未安装（HEVC / RTMP / 本地文件需要它）</span>
+      <span>{{ mpvInstallHint(platform) }}</span>
       <button @click="installMpv">{{ mpvInstallMode === 'download' ? '下载并安装 mpv' : '显示安装命令' }}</button>
       <button v-if="mpvInstallMode && mpvInstallMode !== 'download'" @click="recheckMpv">我已安装，重新检测</button>
       <p v-if="installMessage" class="install-cmd">{{ installMessage }}</p>
@@ -1546,26 +1641,18 @@ onBeforeUnmount(() => {
     <section v-if="mode === 'home'" class="home">
       <h2>观看记录</h2>
       <p v-if="!homeHistory.length" class="home-empty">暂无观看记录，去「点播」看看吧</p>
-      <ul v-else class="home-list" :class="{ 'content-card-grid': contentCardStyle === 'grid' }">
-        <li v-for="h in homeHistory" :key="h.Site + h.VodID" :class="{ 'content-card': contentCardStyle === 'grid' }" @click="resumeVod(h)" @contextmenu="openCardContextMenu('history', h, $event)">
-          <img v-if="h.VodLogo" :src="h.VodLogo" class="thumb" loading="lazy" referrerpolicy="no-referrer" @error="imgError" />
-          <template v-if="contentCardStyle === 'grid'">
-            <span class="content-card-badge content-card-site">{{ h.SiteName || h.Site }}</span>
-            <span v-if="h.EpName || fmtProgress(h.Progress)" class="content-card-badge content-card-progress scrollx" @mouseenter="scrollxEnter" @mouseleave="scrollxLeave"><span class="scrollx-inner"><span v-if="h.EpName" class="cc-ep">{{ h.EpName }}</span><span v-if="fmtProgress(h.Progress)" class="cc-prog">{{ fmtProgress(h.Progress) }}</span></span></span>
-            <span class="content-card-badge content-card-title scrollx" @mouseenter="scrollxEnter" @mouseleave="scrollxLeave"><span class="scrollx-inner">{{ h.VodTitle }}</span></span>
-            <div v-if="isContextCard('history', h)" class="content-card-delete-mask" @click.stop>
-              <button type="button" class="content-card-delete-action" @click.stop="requestDeleteContextCard">删除</button>
-            </div>
-          </template>
-          <template v-else>
-            <span class="home-info">
-              <span class="name">{{ h.VodTitle }}</span>
-              <span class="sub">{{ h.SiteName || h.Site }} · {{ h.EpName }}{{ fmtProgress(h.Progress) ? ' · 看到 ' + fmtProgress(h.Progress) : '' }}</span>
-            </span>
-            <button class="row-delete" type="button" title="删除观看记录" @click.stop="deleteHomeHistory(h)">删除</button>
-          </template>
-        </li>
-      </ul>
+      <ContentCardList
+        v-else
+        list-class="home-list"
+        :items="homeCardItems"
+        :style="contentCardStyle"
+        deletable
+        :active-delete-key="activeDeleteKey"
+        @select="(i) => resumeVod(homeHistory[i])"
+        @contextmenu="(i, event) => openCardContextMenu('history', homeHistory[i], event)"
+        @remove="(i) => deleteHomeHistory(homeHistory[i])"
+        @request-delete="requestDeleteContextCard"
+      />
     </section>
 
     <!-- 点播搜索 -->
@@ -1588,12 +1675,11 @@ onBeforeUnmount(() => {
       </div>
       <p v-if="showVodNoResults" class="home-empty">暂无搜索结果</p>
       <section class="vod-main search-results">
-        <ul>
-          <li v-for="it in vodSearchItems" :key="it.ID + (it.Site || '')" class="channel" @click="openVodDetail(it)">
-            <img v-if="it.Logo" :src="it.Logo" class="thumb" loading="lazy" referrerpolicy="no-referrer" @error="imgError" />
-            <span class="name">{{ it.Title }}</span><span class="group">{{ vodItemSub(it) }}</span>
-          </li>
-        </ul>
+        <ContentCardList
+          :items="vodCardItems"
+          :style="contentCardStyle"
+          @select="(i) => openVodDetail(vodSearchItems[i])"
+        />
       </section>
     </section>
 
@@ -1601,25 +1687,18 @@ onBeforeUnmount(() => {
     <section v-if="mode === 'favorites'" class="favorites-page">
       <h2>点播收藏</h2>
       <p v-if="!vodFavorites.length" class="home-empty">暂无点播收藏</p>
-      <ul v-else class="favorites-list" :class="{ 'content-card-grid': contentCardStyle === 'grid' }">
-        <li v-for="favorite in vodFavorites" :key="favorite.Site + favorite.VodID" :class="{ 'content-card': contentCardStyle === 'grid' }" @click="openVodFavorite(favorite)" @contextmenu="openCardContextMenu('favorite', favorite, $event)">
-          <img v-if="favorite.Logo" :src="favorite.Logo" class="thumb" loading="lazy" referrerpolicy="no-referrer" @error="imgError" />
-          <template v-if="contentCardStyle === 'grid'">
-            <span class="content-card-badge content-card-site">{{ siteName(favorite.Site) || favorite.Site }}</span>
-            <span class="content-card-badge content-card-title scrollx" @mouseenter="scrollxEnter" @mouseleave="scrollxLeave"><span class="scrollx-inner">{{ favorite.Title }}</span></span>
-            <div v-if="isContextCard('favorite', favorite)" class="content-card-delete-mask" @click.stop>
-              <button type="button" class="content-card-delete-action" @click.stop="requestDeleteContextCard">删除</button>
-            </div>
-          </template>
-          <template v-else>
-            <span class="home-info">
-              <span class="name">{{ favorite.Title }}</span>
-              <span class="sub">{{ siteName(favorite.Site) || favorite.Site }}{{ favorite.Group ? ' · ' + favorite.Group : '' }}</span>
-            </span>
-            <button class="row-delete" type="button" title="删除收藏" @click.stop="deleteVodFavorite(favorite)">删除</button>
-          </template>
-        </li>
-      </ul>
+      <ContentCardList
+        v-else
+        list-class="favorites-list"
+        :items="favoriteCardItems"
+        :style="contentCardStyle"
+        deletable
+        :active-delete-key="activeDeleteKey"
+        @select="(i) => openVodFavorite(vodFavorites[i])"
+        @contextmenu="(i, event) => openCardContextMenu('favorite', vodFavorites[i], event)"
+        @remove="(i) => deleteVodFavorite(vodFavorites[i])"
+        @request-delete="requestDeleteContextCard"
+      />
     </section>
 
     <!-- 直播 -->
@@ -1736,18 +1815,13 @@ onBeforeUnmount(() => {
         <section class="vod-main">
           <VodDetailHeader v-if="vodView === 'detail'" :now-playing="vodNowPlaying" @back="backFromVodDetail" />
           <template v-if="vodView !== 'detail'">
-          <ul ref="vodListRef" :class="{ 'content-card-grid': contentCardStyle === 'grid' }" @wheel="onVodListWheel">
-            <li v-for="it in visibleVodItems" :key="it.ID + (it.Site || '')" class="channel" :class="{ 'content-card': contentCardStyle === 'grid' }" @click="openVodDetail(it)">
-              <img v-if="it.Logo" :src="it.Logo" class="thumb" loading="lazy" referrerpolicy="no-referrer" @error="imgError" />
-              <template v-if="contentCardStyle === 'grid'">
-                <span class="content-card-badge content-card-site">{{ siteName(it.Site) || it.Group || '点播' }}</span>
-                <span class="content-card-badge content-card-title scrollx" @mouseenter="scrollxEnter" @mouseleave="scrollxLeave"><span class="scrollx-inner">{{ it.Title }}</span></span>
-              </template>
-              <template v-else>
-                <span class="name">{{ it.Title }}</span><span class="group">{{ vodItemSub(it) }}</span>
-              </template>
-            </li>
-          </ul>
+          <ContentCardList
+            ref="vodListRef"
+            :items="vodCardItems"
+            :style="contentCardStyle"
+            @wheel="onVodListWheel"
+            @select="(i) => openVodDetail(visibleVodItems[i])"
+          />
           <div class="vod-list-footer">
             <button v-if="vodHasMore" type="button" class="vod-list-more" :disabled="vodListLoading" @click="loadNextVodPage">{{ vodListLoading ? '正在加载…' : '继续加载' }}</button>
             <span v-else-if="vodListEnd" class="vod-list-end">已经到达最底部</span>
@@ -1954,8 +2028,8 @@ onBeforeUnmount(() => {
           <button @click="showOpenSource = false">✕</button>
         </div>
         <ul class="oss-list">
-          <li><a href="https://github.com/wailsapp/wails" target="_blank" rel="noopener">Wails</a><span class="oss-ver">v3.0.0-beta.9</span><span class="oss-lic">MIT</span> — 桌面应用框架</li>
-          <li><a href="https://gitlab.com/cznic/sqlite" target="_blank" rel="noopener">modernc.org/sqlite</a><span class="oss-ver">v1.56.0</span><span class="oss-lic">BSD-3</span> — 纯 Go SQLite</li>
+          <li><a href="https://github.com/wailsapp/wails" target="_blank" rel="noopener">Wails</a><span class="oss-ver">v3.0.0-beta.26</span><span class="oss-lic">MIT</span> — 桌面应用框架</li>
+          <li><a href="https://gitlab.com/cznic/sqlite" target="_blank" rel="noopener">modernc.org/sqlite</a><span class="oss-ver">v1.60.1</span><span class="oss-lic">BSD-3</span> — 纯 Go SQLite</li>
           <li><a href="https://github.com/PuerkitoBio/goquery" target="_blank" rel="noopener">goquery</a><span class="oss-ver">v1.13.0</span><span class="oss-lic">BSD-3</span> — HTML 文档解析</li>
           <li><a href="https://github.com/dop251/goja" target="_blank" rel="noopener">goja</a><span class="oss-ver">2026-08-26</span><span class="oss-lic">MIT</span> — Go JavaScript 引擎</li>
           <li><a href="https://github.com/vuejs/core" target="_blank" rel="noopener">Vue</a><span class="oss-ver">v3.5.41</span><span class="oss-lic">MIT</span> — 前端框架</li>
@@ -1972,7 +2046,7 @@ onBeforeUnmount(() => {
           <h2 id="donation-leaderboard-title">捐助榜单</h2>
           <button type="button" aria-label="关闭" @click="showDonations = false">✕</button>
         </div>
-        <ul v-if="donationLeaderboard.Donors.length" class="donation-list">
+        <ul v-if="donationViewState === 'list'" class="donation-list">
           <li v-for="(donor, index) in donationLeaderboard.Donors" :key="donor.ID || 'anonymous-' + index">
             <img
               class="donation-avatar"
@@ -1985,9 +2059,11 @@ onBeforeUnmount(() => {
             <span class="donation-name">{{ donor.Name }}</span>
           </li>
         </ul>
+        <p v-else-if="donationViewState === 'loading'" class="donation-empty">正在加载捐助榜单…</p>
+        <p v-else-if="donationViewState === 'error'" class="donation-empty">加载失败，请稍后重试</p>
         <p v-else class="donation-empty">还没有捐助记录，感谢每一份支持</p>
         <div class="donation-footer">
-          <span class="donation-updated">数据更新于 {{ formatUpdatedAt(donationLeaderboard.UpdatedAt) }}</span>
+          <span v-if="donationUpdatedText !== '未知'" class="donation-updated">数据更新于 {{ donationUpdatedText }}</span>
           <button type="button" class="donation-action" @click="openURL(DONATE_URL)">捐助</button>
         </div>
       </div>
@@ -2028,6 +2104,24 @@ onBeforeUnmount(() => {
         </div>
         <div class="theme-grid">
           <button v-for="t in themeOptions" :key="t.id" type="button" :class="{ active: currentTheme === t.id }" :data-theme="t.id" @click="applyTheme(t.id)">{{ t.label }}</button>
+        </div>
+      </div>
+    </div>
+
+    <p v-if="vodDetailLoading" class="detail-loading" role="status" aria-live="polite">正在加载《{{ vodDetailLoading }}》…</p>
+
+    <div v-if="vodSourceDead" class="settings-overlay" @click.self="vodSourceDeadBack">
+      <div class="settings-panel vod-source-dead" role="dialog" aria-modal="true" aria-labelledby="vod-source-dead-title">
+        <div class="settings-head">
+          <h2 id="vod-source-dead-title">无法访问点播源</h2>
+          <button type="button" aria-label="关闭" @click="vodSourceDeadBack">✕</button>
+        </div>
+        <p>站点「{{ vodSourceDead.info.siteName }}」暂时无法连接，无法打开《{{ vodSourceDead.info.vodTitle }}》。</p>
+        <p class="vod-source-dead-cause">原因：{{ vodSourceDead.info.message }}</p>
+        <p class="vod-source-dead-hint">可以从其他站点找这部剧继续看，或者换个站点重新收藏。</p>
+        <div class="vod-source-dead-actions">
+          <button type="button" @click="vodSourceDeadBack">{{ vodSourceDeadBackLabel(vodSourceDead.origin) }}</button>
+          <button type="button" class="primary" @click="vodSourceDeadSearch">全站搜索该剧</button>
         </div>
       </div>
     </div>

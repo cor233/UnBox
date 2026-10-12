@@ -8,7 +8,7 @@
 UnBox 是一个跨平台（Windows / macOS / Linux）桌面媒体播放器，完全兼容 TVBox，
 目标「安装即用、无手动依赖」。依赖由 [mise](https://mise.jdx.dev) 管理。
 
-技术栈：Go 1.26.3 + Wails v3（**3.0.0-beta.9 钉死**）+ Vue3 + TypeScript。
+技术栈：Go 1.26.3 + Wails v3（**3.0.0-beta.26 钉死**）+ Vue3 + TypeScript。
 
 ## 常用命令
 
@@ -60,7 +60,9 @@ mise run scan          # go run ./cmd/unbox-scan
   - `mpvplugin` — 外部 mpv 探测 + 安装兜底（Windows NSIS 安装包优先使用应用目录内嵌 mpv，随后检查用户插件目录和系统 PATH；Linux/macOS 仍弹安装命令）；
   - `failover` — 故障切换包装。
 - `internal/playback` — 播放编排：Resolver（share 页解析）→ Controller（Web/mpv 路由）
-  → Proxy（本地代理 + HLS 分片重写）。
+  → Proxy（本地代理 + HLS 分片重写）。走 mpv 的只有四种情况（`needsMPV`）：**本地媒体库
+  文件**、RTMP、HEVC 的 HLS、以及 Web 播放失败后的 `Fallback`。Windows/macOS 其余一律走
+  Web，所以「Windows 上总碰到 mpv」通常意味着用户在媒体库看片、或在看 H.265 源。
 - `internal/library` — 本地媒体库：递归扫描识别视频 + 片名/海报匹配，带 token 鉴权与防
   目录穿越的本地文件 HTTP 服务 + 进度门面（M3）。
 - `internal/shell` — 全部 Wails glue（app / 窗口 / 服务）。
@@ -91,4 +93,22 @@ mise run scan          # go run ./cmd/unbox-scan
 - **WebKitGTK 无 MSE**：Linux 上 hls.js/mpegts.js 不可用，HLS/FLV/TS 只能走 mpv；
   路由逻辑在 `internal/playback/controller.go`（`SetWebMSE(false)`）。
 - **mpv JSON IPC**：`set` 命令拒绝 bool/数字（用 `set_property`）；终端事件
-  （EOF/Error）须阻塞发送。
+  （EOF/Error）须阻塞发送。**`exec.Cmd.Wait` 只允许调用一次**：Close / 命令应答
+  超时 / Load 失败清理三处共用 `waiter`（`mpvproc/waiter.go`）收尸，别改回各自 Wait。
+- **mpv 起不来时错误必须能定位**：四层配套，拿掉任何一层，用户就会退回
+  「连接 mpv IPC 失败: 找不到管道」这种无从下手的报错。
+  1. `shell.PickPlayer()`（`internal/shell/pick.go`）是**启动路径**，必须委托给
+     `mpvplugin.Manager`：不要自己 `lookPath("mpv")`——那样既会反转「内嵌优先」
+     的顺序（PATH 上残留的旧 mpv 会盖掉应用自带的），又会绕过预检。
+  2. `mpvplugin.NewPlayer()` 先跑 `mpv --version` 预检（`version.go`）：跑不起来
+     （缺 DLL / 被杀软拦截）或低于 `minMPVVersion` 都当场报错。它不在 `Status()` 里，
+     因为后者被前端高频轮询。
+  3. `mpvproc` 保留子进程 stderr 末尾 4KB（`stderr.go`）。
+  4. 等 IPC 期间监视进程是否提前退出（`ipc.go` 的 `waitForIPC`），并把**退出码**
+     带进报错（`exitcode.go`）——缺 DLL / 架构不匹配 / 崩溃都是零输出秒退，退出码
+     是唯一能区分它们的证据。
+- **`wails3 generate bindings` 在 beta.26 起默认输出 `.js` + JSDoc，必须带 `-ts`**：
+  漏掉时前端静默丢类型（model 塌成 `any`），`vue-tsc` 报 `TS18047`/`TS18046`，
+  看着像代码回归实为命令问题。`build/Taskfile.yml` 的 `generate:bindings` 已带
+  `-ts`（和 `-i`），CI 与 `mise run build:*` 安全；手敲这条命令时须自己加。
+  `frontend/bindings/` 是 gitignore 的生成物，不入库。
